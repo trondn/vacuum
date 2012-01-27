@@ -13,20 +13,36 @@
  *   See the License for the specific language governing permissions and
  *   limitations under the License.
  */
+
+#ifdef WIN32
+#include <Windows.h>
+#include <direct.h>
+#include <io.h>
+#include "getopt.h"
+#define sleep(sec) Sleep(sec * 1000)
+#define chdir(dir) _chdir(dir)
+
+#else
+#include <dirent.h>
+#include <unistd.h>
+#include <getopt.h>
+#endif
+
 #include <stdlib.h>
 #include <stdio.h>
-#include <dirent.h>
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <assert.h>
-#include <unistd.h>
 #include <libcouchbase/couchbase.h>
-
 #include "cJSON.h"
 
 /* The default location we'll monitor for files to upload to Couchbase */
+#ifdef WIN32
+static const char *default_spool = "C:\\vacuum";
+#else
 static const char *default_spool = "/var/spool/vacuum";
+#endif
 
 /* The instance we're using for all our communication to Couchbase */
 libcouchbase_t instance;
@@ -58,15 +74,15 @@ static void error_callback(libcouchbase_t instance,
                            libcouchbase_error_t error,
                            const char *errinfo)
 {
-    /* Ignore timeouts... */
-    if (error != LIBCOUCHBASE_ETIMEDOUT) {
-        fprintf(stderr, "\rFATAL ERROR: %s\n",
-                libcouchbase_strerror(instance, error));
-        if (errinfo && strlen(errinfo) != 0) {
-            fprintf(stderr, "\t\"%s\"\n", errinfo);
-        }
-        exit(EXIT_FAILURE);
-    }
+   /* Ignore timeouts... */
+   if (error != LIBCOUCHBASE_ETIMEDOUT) {
+      fprintf(stderr, "\rFATAL ERROR: %s\n",
+              libcouchbase_strerror(instance, error));
+      if (errinfo && strlen(errinfo) != 0) {
+         fprintf(stderr, "\t\"%s\"\n", errinfo);
+      }
+      exit(EXIT_FAILURE);
+   }
 }
 
 /**
@@ -90,20 +106,20 @@ static void storage_callback(libcouchbase_t instance,
                              const void *cookie,
                              libcouchbase_storage_t operation,
                              libcouchbase_error_t err,
-                             const void *key, size_t nkey,
-                             uint64_t cas)
+                             const void *key, libcouchbase_size_t nkey,
+                             libcouchbase_uint64_t cas)
 {
    int *error = (void*)cookie;
-    if (err == LIBCOUCHBASE_SUCCESS) {
-        *error = 0;
-    } else {
-        *error = 1;
-        fprintf(stderr, "Failed to store \"");
-        fwrite(key, 1, nkey, stderr);
-        fprintf(stderr, "\": %s\n",
-                libcouchbase_strerror(instance, err));
-        fflush(stderr);
-    }
+   if (err == LIBCOUCHBASE_SUCCESS) {
+      *error = 0;
+   } else {
+      *error = 1;
+      fprintf(stderr, "Failed to store \"");
+      fwrite(key, 1, nkey, stderr);
+      fprintf(stderr, "\": %s\n",
+              libcouchbase_strerror(instance, err));
+      fflush(stderr);
+   }
 }
 
 /**
@@ -117,6 +133,8 @@ static void storage_callback(libcouchbase_t instance,
  */
 int loadit(const char *name, char **data, size_t *sz)
 {
+   size_t offset = 0;
+   size_t nr;
    struct stat st;
    FILE *fp;
    char *ptr;
@@ -143,9 +161,7 @@ int loadit(const char *name, char **data, size_t *sz)
       return -1;
    }
 
-   size_t offset = 0;
-   size_t nr;
-   while ((nr = fread(ptr + offset, 1, st.st_size, fp)) != (size_t)-1) {
+   while ((nr = fread(ptr + offset, 1, st.st_size, fp)) != (libcouchbase_size_t)-1) {
       if (nr == 0) {
          break;
       }
@@ -189,7 +205,7 @@ static void invalid_file(enum json_errors reason, const char *name)
       abort();
    }
 
-   snprintf(buffer, sizeof(buffer), "%s-%s", prefix, name);
+   sprintf(buffer, "%s-%s", prefix, name);
    if (rename(name, buffer) == -1) {
       fprintf(stderr, "Failed to rename file: %s\n", strerror(errno));
    }
@@ -199,12 +215,13 @@ static void invalid_file(enum json_errors reason, const char *name)
  * Write a histogram of the timing info.
  */
 static void timings_callback(libcouchbase_t instance, const void *cookie,
-                            libcouchbase_timeunit_t timeunit,
-                            uint32_t min, uint32_t max,
-                            uint32_t total, uint32_t maxtotal)
+                             libcouchbase_timeunit_t timeunit,
+                             libcouchbase_uint32_t min, libcouchbase_uint32_t max,
+                             libcouchbase_uint32_t total, libcouchbase_uint32_t maxtotal)
 {
    char buffer[1024];
-   int offset = sprintf(buffer, "[%3u - %3u]", min, max);
+   int num, ii, offset = sprintf(buffer, "[%3u - %3u]", min, max);
+
    switch (timeunit) {
    case LIBCOUCHBASE_TIMEUNIT_NSEC:
       offset += sprintf(buffer + offset, "ns");
@@ -222,14 +239,68 @@ static void timings_callback(libcouchbase_t instance, const void *cookie,
       ;
    }
 
-   int num = (float)40.0 * (float)total / (float)maxtotal;
+   num = (int)((float)40.0 * (float)total / (float)maxtotal);
    offset += sprintf(buffer + offset, " |");
-   for (int ii = 0; ii < num; ++ii) {
+   for (ii = 0; ii < num; ++ii) {
       offset += sprintf(buffer + offset, "#");
    }
 
    offset += sprintf(buffer + offset, " - %u\n", total);
    fputs(buffer, (FILE*)cookie);
+}
+
+static void process_file(const char *fname)
+{
+   char *ptr = NULL;
+   size_t size;
+   cJSON *json, *id;
+   libcouchbase_error_t ret;
+   int error = 0;
+
+   if (fname[0] == '.') {
+      if (strcmp(fname, ".dump_stats") == 0) {
+         fprintf(stdout, "Dumping stats:\n");
+         libcouchbase_get_timings(instance, stdout, timings_callback);
+         fprintf(stdout, "----\n");
+         remove(fname);
+      }
+      return;
+   }
+
+   if (loadit(fname, &ptr, &size) == -1) {
+      /* Error message already printed */
+      return;
+   }
+
+   if ((json = cJSON_Parse(ptr)) == NULL) {
+      invalid_file(INVALID_JSON, fname);
+      free(ptr);
+      return;
+   }
+
+   id = cJSON_GetObjectItem(json, "_id");
+   if (id == NULL || id->type != cJSON_String) {
+      invalid_file(UNKNOWN_JSON, fname);
+      free(ptr);
+      return;
+   }
+
+   ret = libcouchbase_store(instance, &error, LIBCOUCHBASE_SET,
+                            id->valuestring, strlen(id->valuestring),
+                            ptr, size, 0, 0, 0);
+   if (ret == LIBCOUCHBASE_SUCCESS) {
+      libcouchbase_wait(instance);
+   } else {
+      error = 1;
+   }
+
+   free(ptr);
+   if (error) {
+      fprintf(stderr, "Failed to store %s: %s\n", fname,
+              libcouchbase_strerror(instance, ret));
+   } else {
+      remove(fname);
+   }
 }
 
 /**
@@ -245,6 +316,19 @@ static void timings_callback(libcouchbase_t instance, const void *cookie,
  */
 static void process_directory(void)
 {
+#ifdef WIN32
+   struct _finddata_t file;
+   intptr_t handle = _findfirst("*", &file);
+   if (handle == -1) {
+      fprintf(stderr, "Failed to open directory\n");
+      return;
+   }
+
+   do {
+      process_file(file.name);
+   } while (_findnext(handle, &file) != -1);
+   _findclose(handle);
+#else
    DIR *dp;
    struct dirent *de;
 
@@ -254,60 +338,36 @@ static void process_directory(void)
    }
 
    while ((de = readdir(dp)) != NULL) {
-      char *ptr = NULL;
-      size_t size;
-      cJSON *json, *id;
-      libcouchbase_error_t ret;
-      int error = 0;
-
-      if (de->d_name[0] == '.') {
-         if (strcmp(de->d_name, ".dump_stats") == 0) {
-            fprintf(stdout, "Dumping stats:\n");
-            libcouchbase_get_timings(instance, stdout, timings_callback);
-            fprintf(stdout, "----\n");
-
-            remove(de->d_name);
-         }
-         continue;
-      }
-
-      if (loadit(de->d_name, &ptr, &size) == -1) {
-         /* Error message already printed */
-         continue;
-      }
-
-      if ((json = cJSON_Parse(ptr)) == NULL) {
-         invalid_file(INVALID_JSON, de->d_name);
-         free(ptr);
-         continue;
-      }
-
-      id = cJSON_GetObjectItem(json, "_id");
-      if (id == NULL || id->type != cJSON_String) {
-         invalid_file(UNKNOWN_JSON, de->d_name);
-         free(ptr);
-         continue;
-      }
-
-      ret = libcouchbase_store(instance, &error, LIBCOUCHBASE_SET,
-                               id->valuestring, strlen(id->valuestring),
-                               ptr, size, 0, 0, 0);
-      if (ret == LIBCOUCHBASE_SUCCESS) {
-         libcouchbase_wait(instance);
-      } else {
-         error = 1;
-      }
-
-      free(ptr);
-      if (error) {
-         fprintf(stderr, "Failed to store %s: %s\n", de->d_name,
-                 libcouchbase_strerror(instance, ret));
-      } else {
-         remove(de->d_name);
-      }
+      process_file(de->d_name[0]);
    }
 
    closedir(dp);
+#endif
+}
+
+static void setup_options(struct option *opts)
+{
+   opts[0].name = (char*)"spool";
+   opts[0].has_arg = required_argument;
+   opts[0].val = 's';
+   opts[1].name = (char*)"host";
+   opts[1].has_arg = required_argument;
+   opts[1].val = 'h';
+   opts[2].name = (char*)"user";
+   opts[2].has_arg = required_argument;
+   opts[2].val = 'u';
+   opts[3].name = (char*)"password";
+   opts[3].has_arg = required_argument;
+   opts[3].val = 'p';
+   opts[4].name = (char*)"bucket";
+   opts[4].has_arg = required_argument;
+   opts[4].val = 'b';
+   opts[5].name = (char*)"sleep-time";
+   opts[5].has_arg = required_argument;
+   opts[5].val = 't';
+   opts[6].name = NULL;
+   opts[6].has_arg = required_argument;
+   opts[6].val = -1;
 }
 
 /**
@@ -327,17 +387,22 @@ void main(int argc, char **argv)
    const char *passwd = NULL;
    const char *bucket = NULL;
    int sleep_time = 5;
+   libcouchbase_error_t ret;
+   int cmd;
+   struct option opts[7];
+
+   memset(opts, 0, sizeof(opts));
+   setup_options(opts);
 
    /* Parse command line arguments */
-   int cmd;
-   while ((cmd = getopt(argc, argv,
-                        "s:" /* spool directory */
-                        "h:" /* host */
-                        "u:" /* user */
-                        "p:" /* password */
-                        "b:" /* bucket */
-                        "t:" /* Sleep time */
-                        )) != -1) {
+   while ((cmd = getopt_long(argc, argv,
+                             "s:" /* spool directory */
+                             "h:" /* host */
+                             "u:" /* user */
+                             "p:" /* password */
+                             "b:" /* bucket */
+                             "t:", /* Sleep time */
+                             opts, NULL)) != -1) {
       switch (cmd) {
       case 's' : spool = optarg; break;
       case 'h' : host = optarg; break;
@@ -378,7 +443,7 @@ void main(int argc, char **argv)
    (void)libcouchbase_set_error_callback(instance, error_callback);
 
    /* Tell libcouchback to connect to the server */
-   libcouchbase_error_t ret = libcouchbase_connect(instance);
+   ret = libcouchbase_connect(instance);
    if (ret != LIBCOUCHBASE_SUCCESS) {
       fprintf(stderr, "Failed to connect: %s\n",
               libcouchbase_strerror(instance, ret));
