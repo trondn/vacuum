@@ -45,7 +45,7 @@ static const char *default_spool = "/var/spool/vacuum";
 #endif
 
 /* The instance we're using for all our communication to Couchbase */
-libcouchbase_t instance;
+lcb_t instance;
 
 /**
  * We have two different error situations with respect to JSON.
@@ -70,14 +70,14 @@ enum json_errors {
  * @param error the error condition that just happened
  * @param errinfo possibly more information about the error
  */
-static void error_callback(libcouchbase_t instance,
-                           libcouchbase_error_t error,
+static void error_callback(lcb_t instance,
+                           lcb_error_t error,
                            const char *errinfo)
 {
    /* Ignore timeouts... */
-   if (error != LIBCOUCHBASE_ETIMEDOUT) {
+   if (error != LCB_ETIMEDOUT) {
       fprintf(stderr, "\rFATAL ERROR: %s\n",
-              libcouchbase_strerror(instance, error));
+              lcb_strerror(instance, error));
       if (errinfo && strlen(errinfo) != 0) {
          fprintf(stderr, "\t\"%s\"\n", errinfo);
       }
@@ -86,7 +86,7 @@ static void error_callback(libcouchbase_t instance,
 }
 
 /**
- * Every time a store operation completes libcouchbase will call the
+ * Every time a store operation completes lcb will call the
  * registered storage callback to inform the client application about
  * the result of the operation.
  *
@@ -98,26 +98,23 @@ static void error_callback(libcouchbase_t instance,
  * @param cookie the special cookie the user attached to the request
  * @param operation the operation that just completed
  * @param err the error code indicating the result of the operation
- * @param key the key for the operation
- * @param nkey the number of bytes the key consists of
- * @param cas the cas value for the object if the operation succeeded
+ * @param resp the response object
  */
-static void storage_callback(libcouchbase_t instance,
-                             const void *cookie,
-                             libcouchbase_storage_t operation,
-                             libcouchbase_error_t err,
-                             const void *key, libcouchbase_size_t nkey,
-                             libcouchbase_uint64_t cas)
+static void store_callback(lcb_t instance,
+                           const void *cookie,
+                           lcb_storage_t operation,
+                           lcb_error_t err,
+                           const lcb_store_resp_t *resp)
 {
    int *error = (void*)cookie;
-   if (err == LIBCOUCHBASE_SUCCESS) {
+   if (err == LCB_SUCCESS) {
       *error = 0;
    } else {
       *error = 1;
       fprintf(stderr, "Failed to store \"");
-      fwrite(key, 1, nkey, stderr);
+      fwrite(resp->v.v0.key, 1, resp->v.v0.nkey, stderr);
       fprintf(stderr, "\": %s\n",
-              libcouchbase_strerror(instance, err));
+              lcb_strerror(instance, err));
       fflush(stderr);
    }
 }
@@ -149,7 +146,7 @@ int loadit(const char *name, char **data, size_t *sz)
    ptr = *data = malloc(st.st_size + 1);
    if (ptr == NULL) {
       fprintf(stderr, "Failed to allocate memory");
-      -1;
+      return -1;
    }
    ptr[st.st_size] = '\0';
 
@@ -161,7 +158,7 @@ int loadit(const char *name, char **data, size_t *sz)
       return -1;
    }
 
-   while ((nr = fread(ptr + offset, 1, st.st_size, fp)) != (libcouchbase_size_t)-1) {
+   while ((nr = fread(ptr + offset, 1, st.st_size, fp)) != (lcb_size_t)-1) {
       if (nr == 0) {
          break;
       }
@@ -214,25 +211,25 @@ static void invalid_file(enum json_errors reason, const char *name)
 /**
  * Write a histogram of the timing info.
  */
-static void timings_callback(libcouchbase_t instance, const void *cookie,
-                             libcouchbase_timeunit_t timeunit,
-                             libcouchbase_uint32_t min, libcouchbase_uint32_t max,
-                             libcouchbase_uint32_t total, libcouchbase_uint32_t maxtotal)
+static void timings_callback(lcb_t instance, const void *cookie,
+                             lcb_timeunit_t timeunit,
+                             lcb_uint32_t min, lcb_uint32_t max,
+                             lcb_uint32_t total, lcb_uint32_t maxtotal)
 {
    char buffer[1024];
    int num, ii, offset = sprintf(buffer, "[%3u - %3u]", min, max);
 
    switch (timeunit) {
-   case LIBCOUCHBASE_TIMEUNIT_NSEC:
+   case LCB_TIMEUNIT_NSEC:
       offset += sprintf(buffer + offset, "ns");
       break;
-   case LIBCOUCHBASE_TIMEUNIT_USEC:
+   case LCB_TIMEUNIT_USEC:
       offset += sprintf(buffer + offset, "us");
       break;
-   case LIBCOUCHBASE_TIMEUNIT_MSEC:
+   case LCB_TIMEUNIT_MSEC:
       offset += sprintf(buffer + offset, "ms");
       break;
-   case LIBCOUCHBASE_TIMEUNIT_SEC:
+   case LCB_TIMEUNIT_SEC:
       offset += sprintf(buffer + offset, "s");
       break;
    default:
@@ -254,13 +251,15 @@ static void process_file(const char *fname)
    char *ptr = NULL;
    size_t size;
    cJSON *json, *id;
-   libcouchbase_error_t ret;
+   lcb_error_t ret;
    int error = 0;
+   lcb_store_cmd_t cmd;
+   const lcb_store_cmd_t* const cmds[1] = { &cmd };
 
    if (fname[0] == '.') {
       if (strcmp(fname, ".dump_stats") == 0) {
          fprintf(stdout, "Dumping stats:\n");
-         libcouchbase_get_timings(instance, stdout, timings_callback);
+         lcb_get_timings(instance, stdout, timings_callback);
          fprintf(stdout, "----\n");
          remove(fname);
       }
@@ -285,11 +284,16 @@ static void process_file(const char *fname)
       return;
    }
 
-   ret = libcouchbase_store(instance, &error, LIBCOUCHBASE_SET,
-                            id->valuestring, strlen(id->valuestring),
-                            ptr, size, 0, 0, 0);
-   if (ret == LIBCOUCHBASE_SUCCESS) {
-      libcouchbase_wait(instance);
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.v.v0.key = id->valuestring;
+   cmd.v.v0.nkey = strlen(id->valuestring);
+   cmd.v.v0.bytes = ptr;
+   cmd.v.v0.nbytes = size;
+   cmd.v.v0.operation = LCB_SET;
+
+   ret = lcb_store(instance, &error, 1, cmds);
+   if (ret == LCB_SUCCESS) {
+      lcb_wait(instance);
    } else {
       error = 1;
    }
@@ -297,7 +301,7 @@ static void process_file(const char *fname)
    free(ptr);
    if (error) {
       fprintf(stderr, "Failed to store %s: %s\n", fname,
-              libcouchbase_strerror(instance, ret));
+              lcb_strerror(instance, ret));
    } else {
       remove(fname);
    }
@@ -312,7 +316,7 @@ static void process_file(const char *fname)
  * and know that it won't change while we're operating on the file.
  *
  * There is however one "magic" file: ".dump_stats". Creation of this
- * file will make libcouchbase dump it's internal timing statistics.
+ * file will make lcb dump it's internal timing statistics.
  */
 static void process_directory(void)
 {
@@ -338,7 +342,7 @@ static void process_directory(void)
    }
 
    while ((de = readdir(dp)) != NULL) {
-      process_file(de->d_name[0]);
+      process_file(de->d_name);
    }
 
    closedir(dp);
@@ -379,7 +383,7 @@ static void setup_options(struct option *opts)
  * @param argc argument count
  * @param argv argument vector
  */
-void main(int argc, char **argv)
+int main(int argc, char **argv)
 {
    const char *spool = default_spool;
    const char *host = NULL;
@@ -387,9 +391,11 @@ void main(int argc, char **argv)
    const char *passwd = NULL;
    const char *bucket = NULL;
    int sleep_time = 5;
-   libcouchbase_error_t ret;
+   lcb_error_t ret;
    int cmd;
    struct option opts[7];
+   struct lcb_create_st create_options;
+
 
    memset(opts, 0, sizeof(opts));
    setup_options(opts);
@@ -431,30 +437,36 @@ void main(int argc, char **argv)
       exit(EXIT_FAILURE);
    }
 
-   /* Create the instance to libcouchbase */
-   instance = libcouchbase_create(host, user, passwd, bucket, NULL);
-   if (instance == NULL) {
+   memset(&create_options, 0, sizeof(create_options));
+   create_options.v.v0.host = host;
+   create_options.v.v0.user = user;
+   create_options.v.v0.passwd = passwd;
+   create_options.v.v0.bucket = bucket;
+
+   /* Create the instance to lcb */
+   ret = lcb_create(&instance, &create_options);
+   if (ret != LCB_SUCCESS) {
       fprintf(stderr, "Failed to create couchbase instance\n");
       exit(EXIT_FAILURE);
    }
 
    /* Set up the callbacks we want */
-   (void)libcouchbase_set_storage_callback(instance, storage_callback);
-   (void)libcouchbase_set_error_callback(instance, error_callback);
+   (void)lcb_set_store_callback(instance, store_callback);
+   (void)lcb_set_error_callback(instance, error_callback);
 
    /* Tell libcouchback to connect to the server */
-   ret = libcouchbase_connect(instance);
-   if (ret != LIBCOUCHBASE_SUCCESS) {
+   ret = lcb_connect(instance);
+   if (ret != LCB_SUCCESS) {
       fprintf(stderr, "Failed to connect: %s\n",
-              libcouchbase_strerror(instance, ret));
+              lcb_strerror(instance, ret));
       exit(EXIT_FAILURE);
    }
 
    /* Wait for the server to complete */
-   libcouchbase_wait(instance);
-   if ((ret = libcouchbase_enable_timings(instance) != LIBCOUCHBASE_SUCCESS)) {
+   lcb_wait(instance);
+   if ((ret = lcb_enable_timings(instance) != LCB_SUCCESS)) {
       fprintf(stderr, "Failed to enable timings: %s\n",
-              libcouchbase_strerror(instance, ret));
+              lcb_strerror(instance, ret));
    }
 
    /* Loop forever and process the spool directory */
@@ -475,4 +487,6 @@ void main(int argc, char **argv)
       fprintf(stdout, "\r");
       fflush(stdout);
    }
+
+   return 0;
 }
