@@ -15,6 +15,7 @@
  */
 
 #ifdef WIN32
+#include <winsock2.h>
 #include <Windows.h>
 #include <direct.h>
 #include <io.h>
